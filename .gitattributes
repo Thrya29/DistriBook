@@ -1,0 +1,5 @@
+# Normalise line endings so shell scripts and SQL work inside Linux containers
+# regardless of the contributor's OS.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
