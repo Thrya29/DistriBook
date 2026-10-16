@@ -62,13 +62,26 @@ def register_problem_handlers(app: FastAPI) -> None:
         if mapped is None:
             logger.error("unhandled database error", exc_info=exc)
             return _plain_problem(500, "INTERNAL_ERROR", "Internal error")
-        logger.warning("database unavailable or overloaded: %s", type(exc).__name__)
+        logger.warning(
+            "database unavailable or overloaded",
+            extra={
+                "fields": {
+                    "code": mapped.code,
+                    "sqlstate": sqlstate(exc),
+                    "connection_invalidated": exc.connection_invalidated,
+                    "error": f"{type(exc.orig).__name__}: {exc.orig}"[:300],
+                }
+            },
+        )
         return problem_response(mapped)
 
     @app.exception_handler(OSError)
     async def _os(_: Request, exc: OSError) -> JSONResponse:
         # Connection refused / connect timeout while opening a new pooled connection.
-        logger.warning("database connection failed: %s", exc)
+        logger.warning(
+            "database connection failed",
+            extra={"fields": {"error": f"{type(exc).__name__}: {exc}"[:300]}},
+        )
         return problem_response(DatabaseUnavailable())
 
     @app.exception_handler(Exception)

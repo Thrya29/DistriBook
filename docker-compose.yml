@@ -19,5 +19,17 @@ services:
       timeout: 3s
       retries: 30
 
+  redis:
+    image: redis:7.4-alpine
+    # Locks only: nothing worth persisting, so no snapshots or AOF.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6380:6379"  # 6380 on the host avoids clashing with a locally installed Redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   pgdata:

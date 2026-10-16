@@ -12,7 +12,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from distribook.strategies.base import ClaimResult
+from distribook.strategies.base import BookingStrategy, ClaimResult
 
 _READ = text("SELECT id, status FROM seats WHERE event_id = :event_id AND id = ANY(:seat_ids)")
 _WRITE = text(
@@ -24,7 +24,7 @@ _WRITE = text(
 )
 
 
-class NaiveStrategy:
+class NaiveStrategy(BookingStrategy):
     name = "naive"
 
     def __init__(self, race_window_s: float = 0.0) -> None:

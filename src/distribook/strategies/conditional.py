@@ -4,7 +4,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from distribook.strategies.base import ClaimResult
+from distribook.strategies.base import BookingStrategy, ClaimResult
 
 # The availability check and the write are a single statement. The CTE locks only rows that are
 # still AVAILABLE, in ascending id order (deadlock-free). A transaction that had to wait for a row
@@ -27,7 +27,7 @@ _CLAIM = text(
 )
 
 
-class ConditionalStrategy:
+class ConditionalStrategy(BookingStrategy):
     name = "conditional"
 
     async def claim(

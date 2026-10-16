@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import text
+from sqlalchemy import Row, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -13,6 +13,7 @@ from distribook.config import Settings
 from distribook.db.errors import LOCK_NOT_AVAILABLE, constraint_name, sqlstate
 from distribook.domain.errors import (
     BookingNotFound,
+    DomainError,
     EventNotFound,
     IdempotencyKeyReused,
     InvalidSeats,
@@ -21,11 +22,15 @@ from distribook.domain.errors import (
     SeatUnavailable,
 )
 from distribook.domain.models import BookedSeat, BookingCreate, BookingOut
+from distribook.observability.metrics import Metrics
 from distribook.services.idempotency import request_fingerprint
 from distribook.services.retry import run_with_retries
 from distribook.strategies import BookingStrategy
 
 ONE_ACTIVE_CLAIM_INDEX = "booking_seats_one_active_claim"
+# A key row can vanish between our statements if the purge job deletes it after it expired.
+# Each pass of the claim loop either settles the key or saw it disappear; a few passes suffice.
+_KEY_CLAIM_PASSES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,12 +39,27 @@ class BookingOutcome:
     body: dict[str, Any]
     replayed: bool = False
 
+    @property
+    def label(self) -> str:
+        if self.replayed:
+            return "replayed"
+        if self.status_code == 201:
+            return "created"
+        return str(self.body.get("code", self.status_code)).lower()
+
 
 class BookingService:
-    def __init__(self, engine: AsyncEngine, strategy: BookingStrategy, settings: Settings) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        strategy: BookingStrategy,
+        settings: Settings,
+        metrics: Metrics,
+    ) -> None:
         self._engine = engine
         self._strategy = strategy
         self._settings = settings
+        self._metrics = metrics
 
     @property
     def strategy_name(self) -> str:
@@ -49,10 +69,23 @@ class BookingService:
 
     async def create(self, request: BookingCreate, idempotency_key: str) -> BookingOutcome:
         fingerprint = request_fingerprint(request)
-        return await run_with_retries(
-            lambda: self._create_once(request, idempotency_key, fingerprint),
-            attempts=self._settings.txn_max_attempts,
-        )
+        outcome_label = "error"
+        try:
+            # The guard runs before any database connection is taken (redis_lock uses it to
+            # turn losers away cheaply); everything else happens in the transaction below.
+            async with self._strategy.guard(request.seat_ids):
+                outcome = await run_with_retries(
+                    lambda: self._create_once(request, idempotency_key, fingerprint),
+                    attempts=self._settings.txn_max_attempts,
+                    on_retry=lambda reason: self._metrics.txn_retries.labels(reason).inc(),
+                )
+            outcome_label = outcome.label
+            return outcome
+        except DomainError as exc:
+            outcome_label = exc.code.lower()
+            raise
+        finally:
+            self._metrics.booking_attempts.labels(self.strategy_name, outcome_label).inc()
 
     async def _create_once(
         self, request: BookingCreate, key: str, fingerprint: bytes
@@ -60,8 +93,9 @@ class BookingService:
         async with self._engine.connect() as conn, conn.begin():
             labels = await self._load_seat_labels(conn, request)
 
-            if not await self._reserve_key(conn, request.user_id, key, fingerprint):
-                return await self._replay(conn, request.user_id, key, fingerprint)
+            existing = await self._claim_key(conn, request.user_id, key, fingerprint)
+            if existing is not None:
+                return self._replay(existing, fingerprint)
 
             booking_id = uuid4()
             savepoint = await conn.begin_nested()
@@ -99,10 +133,13 @@ class BookingService:
             raise InvalidSeats(invalid_seat_ids=missing)
         return labels
 
-    async def _reserve_key(
+    async def _claim_key(
         self, conn: AsyncConnection, user_id: str, key: str, fingerprint: bytes
-    ) -> bool:
-        """Claim the idempotency key for this transaction; False if a live row already exists.
+    ) -> Row[Any] | None:
+        """Claim the idempotency key for this transaction.
+
+        Returns None when this transaction now owns the key, or the stored row of an earlier
+        request with the same key, to be replayed.
 
         If another transaction holds the same key uncommitted, the INSERT waits for it to finish
         (bounded by lock_timeout), so concurrent duplicates wait for the original only.
@@ -119,66 +156,72 @@ class BookingService:
             "ttl_s": float(self._settings.idempotency_ttl_s),
         }
         try:
-            inserted = await conn.scalar(
-                text(
-                    """
-                    INSERT INTO idempotency_keys (user_id, key, request_hash, expires_at)
-                    VALUES (:user_id, :key, :request_hash,
-                            now() + make_interval(secs => :ttl_s))
-                    ON CONFLICT (user_id, key) DO NOTHING
-                    RETURNING true
-                    """
-                ),
-                params,
-            )
-            if inserted:
-                return True
-            # A plain UPDATE does not lock a row whose WHERE is false, so for a live key this
-            # is lock-free. For an expired key, exactly one concurrent caller wins the recycle;
-            # the others wait for it and then see a live key.
-            recycled = await conn.scalar(
-                text(
-                    """
-                    UPDATE idempotency_keys
-                    SET request_hash = :request_hash,
-                        response_code = NULL,
-                        response_body = NULL,
-                        booking_id = NULL,
-                        created_at = now(),
-                        expires_at = now() + make_interval(secs => :ttl_s)
-                    WHERE user_id = :user_id AND key = :key AND expires_at <= now()
-                    RETURNING true
-                    """
-                ),
-                params,
-            )
+            for _ in range(_KEY_CLAIM_PASSES):
+                inserted = await conn.scalar(
+                    text(
+                        """
+                        INSERT INTO idempotency_keys (user_id, key, request_hash, expires_at)
+                        VALUES (:user_id, :key, :request_hash,
+                                now() + make_interval(secs => :ttl_s))
+                        ON CONFLICT (user_id, key) DO NOTHING
+                        RETURNING true
+                        """
+                    ),
+                    params,
+                )
+                if inserted:
+                    return None
+                # A plain UPDATE does not lock a row whose WHERE is false, so for a live key
+                # this is lock-free. For an expired key exactly one concurrent caller wins the
+                # recycle; the others wait for it and then see a live key.
+                recycled = await conn.scalar(
+                    text(
+                        """
+                        UPDATE idempotency_keys
+                        SET request_hash = :request_hash,
+                            response_code = NULL,
+                            response_body = NULL,
+                            booking_id = NULL,
+                            created_at = now(),
+                            expires_at = now() + make_interval(secs => :ttl_s)
+                        WHERE user_id = :user_id AND key = :key AND expires_at <= now()
+                        RETURNING true
+                        """
+                    ),
+                    params,
+                )
+                if recycled:
+                    return None
+                existing = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_hash, response_code,
+                                   CAST(response_body AS text) AS body
+                            FROM idempotency_keys WHERE user_id = :user_id AND key = :key
+                            """
+                        ),
+                        params,
+                    )
+                ).one_or_none()
+                if existing is not None:
+                    return existing
+                # The expired row was purged between our statements: start over.
         except DBAPIError as exc:
             if sqlstate(exc) == LOCK_NOT_AVAILABLE:
                 raise RequestInProgress() from exc
             raise
-        return bool(recycled)
+        raise RuntimeError("idempotency key kept disappearing while being claimed")
 
-    async def _replay(
-        self, conn: AsyncConnection, user_id: str, key: str, fingerprint: bytes
-    ) -> BookingOutcome:
-        row = (
-            await conn.execute(
-                text(
-                    """
-                    SELECT request_hash, response_code, CAST(response_body AS text) AS body
-                    FROM idempotency_keys WHERE user_id = :user_id AND key = :key
-                    """
-                ),
-                {"user_id": user_id, "key": key},
-            )
-        ).one()
-        if bytes(row.request_hash) != fingerprint:
+    @staticmethod
+    def _replay(existing: Row[Any], fingerprint: bytes) -> BookingOutcome:
+        if bytes(existing.request_hash) != fingerprint:
             raise IdempotencyKeyReused()
-        if row.response_code is None:
+        if existing.response_code is None:
             # The owning transaction always records an outcome before it commits, so a
             # committed row without one would mean a broken invariant, not a race.
             raise RuntimeError("idempotency row committed without an outcome")
-        return BookingOutcome(row.response_code, json.loads(row.body), replayed=True)
+        return BookingOutcome(existing.response_code, json.loads(existing.body), replayed=True)
 
     async def _claim(
         self,
@@ -314,6 +357,7 @@ class BookingService:
         return await run_with_retries(
             lambda: self._cancel_once(booking_id, user_id),
             attempts=self._settings.txn_max_attempts,
+            on_retry=lambda reason: self._metrics.txn_retries.labels(reason).inc(),
         )
 
     async def _cancel_once(self, booking_id: UUID, user_id: str) -> BookingOut:

@@ -1,6 +1,7 @@
+from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -17,19 +18,26 @@ class ClaimResult:
         return not self.unavailable
 
 
-class BookingStrategy(Protocol):
-    """Claims seats for a booking inside the caller's open transaction.
+class BookingStrategy(ABC):
+    """Concurrency control for claiming seats.
 
-    Contract:
-    - On success every requested seat is ``BOOKED`` with ``booking_id`` set, in this transaction.
-    - On failure it returns the seats that could not be claimed. Any partial changes it made are
-      undone by the caller rolling back to its savepoint.
-    - Row locks on multiple seats are acquired in ascending seat id order.
-    - Lock waits are bounded by the session ``lock_timeout``; the resulting error propagates.
+    ``claim`` contract:
+    - runs inside the caller's open transaction;
+    - on success every requested seat is ``BOOKED`` with ``booking_id`` set;
+    - on failure returns the seats that could not be claimed; the caller rolls back to its
+      savepoint, undoing any partial changes;
+    - row locks on several seats are taken in ascending seat id order;
+    - lock waits are bounded by the session ``lock_timeout``; that error propagates.
     """
 
     name: str
 
+    def guard(self, seat_ids: Sequence[int]) -> AbstractAsyncContextManager[None]:
+        """Entered before a database connection is taken. A strategy may reject the request
+        here, cheaply, by raising ``SeatContended``. The default does nothing."""
+        return nullcontext()
+
+    @abstractmethod
     async def claim(
         self, conn: AsyncConnection, *, event_id: int, seat_ids: Sequence[int], booking_id: UUID
     ) -> ClaimResult: ...
