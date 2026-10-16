@@ -17,6 +17,22 @@ jobs:
     name: Lint, type-check, test
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.9-alpine
+        env:
+          POSTGRES_USER: distribook
+          POSTGRES_PASSWORD: distribook
+          POSTGRES_DB: distribook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U distribook"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DISTRIBOOK_TEST_DATABASE_URL: postgresql+asyncpg://distribook:distribook@127.0.0.1:5432/distribook_test
     steps:
       - uses: actions/checkout@v4
 
@@ -37,5 +53,13 @@ jobs:
       - name: Type-check
         run: uv run mypy
 
-      - name: Test
+      - name: Migrations apply cleanly and fully reverse
+        env:
+          DISTRIBOOK_DATABASE_URL: postgresql+asyncpg://distribook:distribook@127.0.0.1:5432/distribook
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: Test (unit + integration against PostgreSQL)
         run: uv run pytest
