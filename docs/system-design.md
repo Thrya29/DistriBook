@@ -166,7 +166,7 @@ with a stable machine-readable `code` field.
 | `GET /v1/bookings/{booking_id}` | Booking with its seats | `200` | `404` |
 | `POST /v1/bookings/{booking_id}/cancel` | Cancel; idempotent | `200` | `404` |
 | `GET /healthz` | Liveness: process is up | `200` | — |
-| `GET /readyz` | Readiness: DB reachable (and Redis, if configured) | `200` | `503` |
+| `GET /readyz` | Readiness: DB reachable. Redis status is reported but never makes the replica unready (it has a fallback) | `200` | `503` |
 | `GET /metrics` | Prometheus exposition | `200` | — |
 
 ### `POST /v1/bookings`
@@ -329,10 +329,18 @@ write" pattern. It takes one extra round trip while holding the locks, which the
 measure. With `NOWAIT`, a busy seat fails straight away with `55P03`, which maps to `409 SEAT_CONTENDED`.
 Losers give up immediately instead of queueing for the lock.
 
+This strategy locks *every* requested seat, booked or not, and holds lower-numbered seats while it
+waits for higher ones, so overlapping multi-seat requests can form wait chains. In the contention
+suite, where both replicas and all clients share one CPU-saturated event loop, lock waits
+occasionally ran past `lock_timeout`, giving retryable `409 SEAT_CONTENDED` / `503` responses.
+This happened with `pessimistic` on overlapping multi-seat requests and with `conditional` on the
+hot seat. Correctness was never affected: no double booking, no partial booking, no deadlock. How
+often each strategy times out under realistic load is for the benchmarks to measure, not the tests.
+
 ### 6.3 `redis_lock`
 
 1. Before taking a DB connection: for each seat in ascending order,
-   `SET lock:seat:{id} <token> NX PX 2000`. If any of these fails, release the locks already held
+   `SET distribook:lock:seat:{id} <token> NX PX 2000`. If any of these fails, release the locks already held
    (compare-and-delete Lua script) and return `409 SEAT_CONTENDED`.
 2. Run the transaction above using the `conditional` claim.
 3. Release the locks in `finally`.
@@ -343,7 +351,13 @@ the pool when a hot seat draws heavy contention. Correctness never depends on Re
 or Redis fails over and two requests both reach the database, the conditional write still lets only
 one of them win. The conditional write acts as the fencing token. If Redis is unreachable, the
 strategy skips the lock step and falls back to `conditional` (`distribook_redis_fallback_total`)
-instead of refusing requests.
+instead of refusing requests. Redis calls have short timeouts (250 ms) and no client retries, and
+after a failure the gate is skipped for a few seconds (a simple circuit breaker), so a down Redis
+costs at most one short timeout per few seconds, not one per request.
+
+One trade-off: the gate runs before the idempotency check, so a *retry* of a request that is still
+holding its seat locks gets `409 SEAT_CONTENDED` rather than waiting for the replay. The response
+is retryable, and the next retry replays the stored result.
 
 ### 6.4 `naive` — deliberately unsafe, test-only
 
@@ -393,7 +407,7 @@ The cancel request body carries `user_id`. If it doesn't match the booking's own
 | Client times out and retries | Same key → replay or wait for the in-flight original | INV-4 |
 | PostgreSQL down | `/readyz` → `503`, nginx stops routing to the replica; requests get `503 DATABASE_UNAVAILABLE` quickly | Fail closed: no booking without the source of truth |
 | PostgreSQL restarts | Pool drops dead connections (`pool_pre_ping`), reconnects | Committed data is durable (WAL) |
-| Redis down | `redis_lock` falls back to `conditional` | Redis is not part of correctness |
+| Redis down | `redis_lock` falls back to `conditional`; readiness stays `200` and reports `redis: down` | Redis is not part of correctness |
 | Redis lock expires mid-request | A second request may reach the DB | Conditional write still lets only one win |
 | Hot seat / overload | Lock timeout → `409 SEAT_CONTENDED`; pool timeout → `503` + `Retry-After` | Bounded latency instead of piling up |
 | Deadlock | Prevented by lock ordering; retried if it ever happens | Counter shows it never happens |
@@ -459,14 +473,20 @@ Full method: `docs/benchmark-methodology.md` (written in Phase 5).
 ## 11. Observability
 
 - **Logs:** one JSON line per request with `request_id` (taken from an incoming `X-Request-ID`
-  or generated), route, status, duration and strategy. Booking outcomes are logged with `booking_id`.
+  or generated), method, route template, path, status and duration. Booking outcomes are counted
+  per strategy in metrics rather than logged one by one.
   User data is limited to `user_id`.
 - **Metrics:**
   - `http_request_duration_seconds{route,method,status}` (histogram)
   - `distribook_booking_attempts_total{strategy,outcome}`
   - `distribook_txn_retries_total{reason}`
-  - `distribook_db_pool_in_use`, `distribook_db_pool_wait_seconds`
+  - `distribook_db_pool_in_use`, `distribook_db_pool_size`
   - `distribook_redis_fallback_total`
+  - `distribook_idempotency_keys_purged_total`
+- **Housekeeping:** every replica runs a periodic purge of expired idempotency keys in small
+  batches. A transaction-level advisory lock (`pg_try_advisory_xact_lock`) means only one replica
+  purges at a time, and `FOR UPDATE SKIP LOCKED` leaves alone any key a request is recycling. If a
+  key disappears between a request's statements, the request starts its key claim over.
 - **Process model:** one uvicorn worker per container. Scale by adding replicas, not workers. This
   avoids Prometheus multiprocess mode and keeps one process = one pool = one set of metrics
   ([ADR-0005](adr/0005-sqlalchemy-core-and-single-worker-containers.md)).
@@ -479,6 +499,11 @@ replicas (which wait for `migrate` to finish successfully) → nginx. Optional p
 
 - Multi-stage image, slim Python 3.12 base, non-root user, no build tools in the final image.
 - Health checks gate start-up order and nginx routing.
+- Each replica opens its whole connection pool at start-up (`DISTRIBOOK_DB_POOL_PREWARM`). Without
+  this, the first burst after a deploy has to open every connection at once while also serving
+  requests. In the contention suite that showed up as occasional connect timeouts (`503
+  DATABASE_UNAVAILABLE`) on the first test of a run; with pre-warming, six consecutive full runs
+  were clean. A database that is down at start-up is logged, not fatal: readiness reports it.
 - `SIGTERM` → stop accepting requests, finish in-flight requests (≤ 10 s), close the pool.
 - All configuration comes from environment variables. `.env.example` lists every setting and its default. No secrets are committed.
 

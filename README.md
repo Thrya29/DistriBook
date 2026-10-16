@@ -21,8 +21,8 @@ each one behaves under load.
 | 1 | [Requirements](docs/requirements.md), [system design](docs/system-design.md), [ADRs](docs/adr/) | ✅ Done |
 | 2 | Schema & migrations, full booking API (`conditional` strategy), idempotency, cancellation, integration tests | ✅ Done |
 | 3 | Concurrency & failure test suites, plus proof that the suite catches a race | ✅ Done |
-| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; structured logs & Prometheus metrics | ⏳ Next |
-| 5 | Multi-replica Docker Compose stack (nginx), k6 scenarios, benchmark pipeline | ⏳ |
+| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; JSON logs, Prometheus metrics, key purge job | ✅ Done |
+| 5 | Multi-replica Docker Compose stack (nginx), k6 scenarios, benchmark pipeline | ⏳ Next |
 | 6 | Benchmark runs, analysis, final documentation | ⏳ |
 
 ## How double booking is prevented (summary)
@@ -70,12 +70,30 @@ Content-Type: application/problem+json
 {"code": "SEAT_UNAVAILABLE", "unavailable_seat_ids": [1, 2], ...}
 ```
 
+## Concurrency strategies
+
+The booking race is handled by a pluggable strategy (`DISTRIBOOK_BOOKING_STRATEGY`). All of them
+run under the same correctness tests, and Phase 6 benchmarks them under identical load.
+
+| Strategy | How it claims seats | When a seat is busy |
+|---|---|---|
+| `conditional` (default) | one `UPDATE … WHERE status = 'AVAILABLE'` that locks only still-available rows, in id order | waits for the holder, then reports the real outcome |
+| `pessimistic` | `SELECT … FOR UPDATE` on every requested row in id order, check in the application, then `UPDATE` | waits for the holder, then reports the real outcome |
+| `pessimistic_nowait` | as above with `FOR UPDATE NOWAIT` | fails at once with retryable `409 SEAT_CONTENDED` |
+| `redis_lock` | per-seat Redis lock *before* using a DB connection, then the `conditional` write | rejected at Redis with retryable `409 SEAT_CONTENDED`, without touching the database |
+| `naive` | check, then write (**unsafe**, test-only, refused in production) | double-books; exists to prove the tests catch races |
+
+Redis is never what makes a booking correct ([ADR-0003](docs/adr/0003-redis-is-an-optimisation-not-a-correctness-dependency.md)):
+if a Redis lock expires early, the conditional database write still picks exactly one winner, and
+if Redis is down the strategy falls back to the database-only path.
+
 ## What the tests prove
 
 Every concurrency and integration test ends by running SQL checks against the database for the
 [correctness invariants](docs/requirements.md#6-correctness-invariants), e.g. *no seat has two
 active bookings*. The contention tests run against **two API replicas with separate connection
-pools** sharing one database, with every request released at the same instant.
+pools** sharing one database, with every request released at the same instant, and **every
+scenario runs once per safe strategy**.
 
 | Scenario | Result asserted |
 |---|---|
@@ -91,6 +109,8 @@ pools** sharing one database, with every request released at the same instant.
 | Every pooled connection killed (database restart) | the next requests succeed |
 | Database unreachable / pool exhausted | `503` + `Retry-After` within bounded time |
 | Seat row locked elsewhere / duplicate of a stuck request | `409 SEAT_CONTENDED` / `409 REQUEST_IN_PROGRESS`; not stored, so the retry succeeds |
+| `redis_lock` with Redis down | every booking takes the database path; exactly one winner; readiness stays `200` |
+| `redis_lock` with locks that expire after 1 ms | many requests pass the gate together; the database still allows exactly one winner |
 
 The suite also caught a real bug during development: a lock convoy in the idempotency step,
 written up in [ADR-0004](docs/adr/0004-idempotency-in-the-booking-transaction.md#lesson-from-testing-do-nothing-not-do-update--where).
@@ -100,7 +120,7 @@ written up in [ADR-0004](docs/adr/0004-idempotency-in-the-booking-transaction.md
 Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
-docker compose up -d --wait postgres     # PostgreSQL 16 on 127.0.0.1:5432
+docker compose up -d --wait postgres redis   # PostgreSQL on :5432, Redis on :6380
 uv sync                                  # create .venv with locked dependencies
 uv run alembic upgrade head              # apply migrations
 uv run uvicorn distribook.main:create_app --factory --port 8000
@@ -109,10 +129,21 @@ uv run uvicorn distribook.main:create_app --factory --port 8000
 Settings are read from `DISTRIBOOK_*` environment variables. See [.env.example](.env.example).
 A single `docker compose up` for the whole multi-replica stack arrives in Phase 5.
 
+## Observability
+
+- **Logs:** one JSON object per line on stdout, with the request's `X-Request-ID` (echoed from the
+  client or generated) on every line and an access line per request (route template, status,
+  duration).
+- **Metrics** at `/metrics` (Prometheus): request latency histogram by route template, booking
+  outcomes per strategy, transaction retries (expected to stay 0), connection-pool usage, Redis
+  fallbacks, purged idempotency keys.
+- **Health:** `/healthz` (process alive) and `/readyz` (database reachable; Redis status is reported
+  but never makes a replica unready, because it has a fallback).
+
 ## Development
 
 ```bash
-uv run pytest              # all tests (needs the postgres container running)
+uv run pytest              # all tests (needs the postgres and redis containers running)
 uv run ruff check .        # lint
 uv run ruff format .       # format
 uv run mypy                # type-check (strict)
@@ -120,8 +151,8 @@ uv run mypy                # type-check (strict)
 
 Integration tests run against a real PostgreSQL. The test database (`distribook_test`) is dropped,
 recreated and migrated at the start of each run, and the suite refuses to run against any
-database whose name doesn't end in `_test`. CI runs the same tests against a PostgreSQL service
-container, and checks that migrations can be applied and fully reversed.
+database whose name doesn't end in `_test`. CI runs the same tests against PostgreSQL and Redis
+service containers, and checks that migrations can be applied and fully reversed.
 
 ## Repository layout
 
@@ -129,8 +160,9 @@ container, and checks that migrations can be applied and fully reversed.
 src/distribook/
 ├── api/             HTTP routes, problem+json error mapping
 ├── domain/          request/response models, domain errors
-├── services/        booking & catalog orchestration, idempotency, retry policy
-├── strategies/      pluggable concurrency control (conditional; naive = unsafe, test-only)
+├── services/        booking & catalog orchestration, idempotency, retries, key purge
+├── strategies/      conditional, pessimistic(_nowait), redis_lock; naive = unsafe, test-only
+├── observability/   JSON logging, request-id middleware, Prometheus metrics
 ├── db/              connection pool, PostgreSQL error classification
 ├── invariants.py    SQL checks for the correctness invariants
 └── main.py          application factory

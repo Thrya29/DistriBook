@@ -24,7 +24,13 @@ is best is weaker than measuring them against each other.
 
 - The same correctness and load suites run against every strategy. The comparison is like-for-like.
 - `naive` lets us show that the tests *can* detect a race. Without that, a passing test would prove nothing.
-- More code paths to maintain. This is limited by keeping each strategy to just its `claim()` step.
+- More code paths to maintain. This is limited by keeping each strategy to just its `claim()` step
+  (plus an optional pre-connection `guard()`, used only by `redis_lock`).
+- Observation from the shared suite: under extreme contention on a CPU-saturated test harness, lock
+  waits occasionally exceed `lock_timeout` (seen with `pessimistic` on overlapping multi-seat
+  requests and with `conditional` on a single hot seat). They surface as retryable `409`/`503`, as
+  designed. No strategy ever lost correctness. Relative timeout rates are measured by the
+  benchmarks (system design §6.2).
 
 ## Alternatives considered
 
