@@ -37,3 +37,13 @@ def test_event_requires_timezone() -> None:
 def test_lock_timeout_must_be_below_statement_timeout() -> None:
     with pytest.raises(ValidationError):
         Settings(db_lock_timeout_ms=2000, db_statement_timeout_ms=2000)
+
+
+def test_unsafe_strategy_requires_explicit_opt_in() -> None:
+    with pytest.raises(ValidationError, match="can double-book"):
+        Settings(booking_strategy="naive")
+
+
+def test_unsafe_strategy_is_never_allowed_in_production() -> None:
+    with pytest.raises(ValidationError, match="never allowed in production"):
+        Settings(booking_strategy="naive", enable_unsafe_strategies=True, env="production")

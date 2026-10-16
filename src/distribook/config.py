@@ -5,7 +5,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-StrategyName = Literal["conditional"]
+StrategyName = Literal["conditional", "naive"]
+UNSAFE_STRATEGIES: frozenset[str] = frozenset({"naive"})
 
 
 class Settings(BaseSettings):
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     db_idle_in_transaction_timeout_ms: int = Field(default=5000, ge=1)
 
     booking_strategy: StrategyName = "conditional"
+    enable_unsafe_strategies: bool = False
 
     idempotency_ttl_s: int = Field(default=24 * 60 * 60, ge=60)
     txn_max_attempts: int = Field(default=3, ge=1, le=10)
@@ -32,6 +34,20 @@ class Settings(BaseSettings):
         # instead of the more precise "contended" error.
         if self.db_lock_timeout_ms >= self.db_statement_timeout_ms:
             raise ValueError("db_lock_timeout_ms must be smaller than db_statement_timeout_ms")
+        return self
+
+    @model_validator(mode="after")
+    def _unsafe_strategies_need_explicit_opt_in(self) -> "Settings":
+        if self.booking_strategy in UNSAFE_STRATEGIES:
+            if self.env == "production":
+                raise ValueError(
+                    f"strategy {self.booking_strategy!r} is never allowed in production"
+                )
+            if not self.enable_unsafe_strategies:
+                raise ValueError(
+                    f"strategy {self.booking_strategy!r} can double-book; "
+                    "set enable_unsafe_strategies=true to use it for testing"
+                )
         return self
 
     @property
