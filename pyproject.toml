@@ -5,12 +5,22 @@ description = "A concurrency-correct seat booking service with reproducible load
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "alembic>=1.14",
+    "asyncpg>=0.30",
+    "fastapi>=0.115",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "uvicorn[standard]>=0.32",
+]
 
 [dependency-groups]
 dev = [
+  "httpx>=0.28",
   "mypy>=1.13",
   "pytest>=8.3",
+  "pytest-asyncio>=0.25",
   "ruff>=0.8",
 ]
 
@@ -40,13 +50,20 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]  # assert is the point of a test
+"tests/**" = ["S101", "S105"]  # asserts and literal test keys are the point of a test
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]  # asyncpg ships no type information
+ignore_missing_imports = true

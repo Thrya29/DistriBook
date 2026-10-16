@@ -1,0 +1,45 @@
+"""Runtime configuration. Every setting is read from a ``DISTRIBOOK_*`` environment variable."""
+
+from typing import Literal
+
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+StrategyName = Literal["conditional"]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="DISTRIBOOK_", frozen=True)
+
+    env: Literal["development", "test", "production"] = "development"
+
+    database_url: str = "postgresql+asyncpg://distribook:distribook@127.0.0.1:5432/distribook"
+    db_pool_size: int = Field(default=10, ge=1, le=100)
+    db_pool_timeout_s: float = Field(default=2.0, gt=0)
+    db_connect_timeout_s: float = Field(default=5.0, gt=0)
+    db_statement_timeout_ms: int = Field(default=2000, ge=1)
+    db_lock_timeout_ms: int = Field(default=1000, ge=1)
+    db_idle_in_transaction_timeout_ms: int = Field(default=5000, ge=1)
+
+    booking_strategy: StrategyName = "conditional"
+
+    idempotency_ttl_s: int = Field(default=24 * 60 * 60, ge=60)
+    txn_max_attempts: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _lock_wait_must_be_shorter_than_statement(self) -> "Settings":
+        # A lock wait that outlives the statement would surface as a generic timeout
+        # instead of the more precise "contended" error.
+        if self.db_lock_timeout_ms >= self.db_statement_timeout_ms:
+            raise ValueError("db_lock_timeout_ms must be smaller than db_statement_timeout_ms")
+        return self
+
+    @property
+    def server_settings(self) -> dict[str, str]:
+        """PostgreSQL session settings applied to every pooled connection."""
+        return {
+            "application_name": "distribook",
+            "statement_timeout": f"{self.db_statement_timeout_ms}ms",
+            "lock_timeout": f"{self.db_lock_timeout_ms}ms",
+            "idle_in_transaction_session_timeout": f"{self.db_idle_in_transaction_timeout_ms}ms",
+        }
