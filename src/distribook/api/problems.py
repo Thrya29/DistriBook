@@ -32,7 +32,8 @@ def classify_db_error(exc: DBAPIError) -> DomainError | None:
     state = sqlstate(exc)
     if state in (QUERY_CANCELED, LOCK_NOT_AVAILABLE):
         return ServiceOverloaded()
-    if exc.connection_invalidated or state is None or state.startswith("08"):
+    # Class 08: connection exceptions. 57P0x: server shutting down / backend terminated.
+    if exc.connection_invalidated or state is None or state.startswith(("08", "57P")):
         return DatabaseUnavailable()
     return None
 
@@ -49,7 +50,7 @@ def register_problem_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(HTTPException)
     async def _http(_: Request, exc: HTTPException) -> JSONResponse:
-        return _plain_problem(exc.status_code, f"HTTP_{exc.status_code}", str(exc.detail))
+        return _plain_problem(exc.status_code, f"HTTP_{exc.status_code}", exc.detail)
 
     @app.exception_handler(PoolTimeoutError)
     async def _pool_timeout(_: Request, exc: PoolTimeoutError) -> JSONResponse:
