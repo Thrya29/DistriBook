@@ -1,4 +1,6 @@
+from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import text
 
 from tests.integration.helpers import book, create_event, seat_ids
 
@@ -80,3 +82,19 @@ async def test_validation_failures_do_not_consume_the_key(client: AsyncClient) -
     response = await book(client, event["id"], [seat], key="k1")
 
     assert response.status_code == 201
+
+
+async def test_expired_key_is_recycled_for_a_new_request(app: FastAPI, client: AsyncClient) -> None:
+    event = await create_event(client, rows=1, seats_per_row=2)
+    seats = await seat_ids(client, event["id"])
+    first = await book(client, event["id"], [seats[0]], key="expiring")
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE idempotency_keys SET expires_at = now() - interval '1 second'")
+        )
+
+    reused = await book(client, event["id"], [seats[1]], key="expiring")
+
+    assert reused.status_code == 201
+    assert "idempotent-replayed" not in reused.headers
+    assert reused.json()["id"] != first.json()["id"]

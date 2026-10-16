@@ -102,12 +102,22 @@ class BookingService:
     async def _reserve_key(
         self, conn: AsyncConnection, user_id: str, key: str, fingerprint: bytes
     ) -> bool:
-        """Insert the idempotency row; False if a live row already exists for this key.
+        """Claim the idempotency key for this transaction; False if a live row already exists.
 
-        If another transaction holds the same key uncommitted, PostgreSQL makes this statement
-        wait for it to finish (bounded by lock_timeout), so concurrent duplicates serialise here.
-        An expired row is recycled in place.
+        If another transaction holds the same key uncommitted, the INSERT waits for it to finish
+        (bounded by lock_timeout), so concurrent duplicates wait for the original only.
+
+        ON CONFLICT DO NOTHING is deliberate. DO UPDATE ... WHERE would lock the existing row
+        even when its WHERE is false, so every duplicate would hold that lock until its own
+        transaction ended and duplicates would queue behind each other (a lock convoy). An
+        expired row is instead recycled by a separate conditional UPDATE, on the rare path only.
         """
+        params = {
+            "user_id": user_id,
+            "key": key,
+            "request_hash": fingerprint,
+            "ttl_s": float(self._settings.idempotency_ttl_s),
+        }
         try:
             inserted = await conn.scalar(
                 text(
@@ -115,29 +125,38 @@ class BookingService:
                     INSERT INTO idempotency_keys (user_id, key, request_hash, expires_at)
                     VALUES (:user_id, :key, :request_hash,
                             now() + make_interval(secs => :ttl_s))
-                    ON CONFLICT (user_id, key) DO UPDATE
-                        SET request_hash = EXCLUDED.request_hash,
-                            response_code = NULL,
-                            response_body = NULL,
-                            booking_id = NULL,
-                            created_at = now(),
-                            expires_at = EXCLUDED.expires_at
-                        WHERE idempotency_keys.expires_at <= now()
+                    ON CONFLICT (user_id, key) DO NOTHING
                     RETURNING true
                     """
                 ),
-                {
-                    "user_id": user_id,
-                    "key": key,
-                    "request_hash": fingerprint,
-                    "ttl_s": float(self._settings.idempotency_ttl_s),
-                },
+                params,
+            )
+            if inserted:
+                return True
+            # A plain UPDATE does not lock a row whose WHERE is false, so for a live key this
+            # is lock-free. For an expired key, exactly one concurrent caller wins the recycle;
+            # the others wait for it and then see a live key.
+            recycled = await conn.scalar(
+                text(
+                    """
+                    UPDATE idempotency_keys
+                    SET request_hash = :request_hash,
+                        response_code = NULL,
+                        response_body = NULL,
+                        booking_id = NULL,
+                        created_at = now(),
+                        expires_at = now() + make_interval(secs => :ttl_s)
+                    WHERE user_id = :user_id AND key = :key AND expires_at <= now()
+                    RETURNING true
+                    """
+                ),
+                params,
             )
         except DBAPIError as exc:
             if sqlstate(exc) == LOCK_NOT_AVAILABLE:
                 raise RequestInProgress() from exc
             raise
-        return bool(inserted)
+        return bool(recycled)
 
     async def _replay(
         self, conn: AsyncConnection, user_id: str, key: str, fingerprint: bytes
