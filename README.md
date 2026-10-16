@@ -20,8 +20,8 @@ each one behaves under load.
 | 0 | Repository skeleton, tooling, CI | ✅ Done |
 | 1 | [Requirements](docs/requirements.md), [system design](docs/system-design.md), [ADRs](docs/adr/) | ✅ Done |
 | 2 | Schema & migrations, full booking API (`conditional` strategy), idempotency, cancellation, integration tests | ✅ Done |
-| 3 | Concurrency & failure test suites (hot seat, overlapping multi-seat, duplicate keys, crash mid-transaction) | ⏳ Next |
-| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; structured logs & Prometheus metrics | ⏳ |
+| 3 | Concurrency & failure test suites, plus proof that the suite catches a race | ✅ Done |
+| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; structured logs & Prometheus metrics | ⏳ Next |
 | 5 | Multi-replica Docker Compose stack (nginx), k6 scenarios, benchmark pipeline | ⏳ |
 | 6 | Benchmark runs, analysis, final documentation | ⏳ |
 
@@ -35,8 +35,8 @@ each one behaves under load.
 3. **Deadlock-free multi-seat bookings:** every transaction locks seats in ascending ID order.
 4. **Safe retries:** an `Idempotency-Key` is recorded in the *same transaction* as the booking, so a
    retried request replays the original result instead of booking twice.
-5. **Every test checks correctness:** after each integration test, SQL checks verify that the
-   correctness invariants (e.g. *no seat has two active bookings*) still hold.
+5. **Proof the tests can catch a race:** the contention suite is also run against a deliberately
+   unsafe strategy with the safety-net index removed, and it detects the double booking.
 
 The full reasoning is in the [system design](docs/system-design.md) and [ADRs](docs/adr/).
 
@@ -70,6 +70,31 @@ Content-Type: application/problem+json
 {"code": "SEAT_UNAVAILABLE", "unavailable_seat_ids": [1, 2], ...}
 ```
 
+## What the tests prove
+
+Every concurrency and integration test ends by running SQL checks against the database for the
+[correctness invariants](docs/requirements.md#6-correctness-invariants), e.g. *no seat has two
+active bookings*. The contention tests run against **two API replicas with separate connection
+pools** sharing one database, with every request released at the same instant.
+
+| Scenario | Result asserted |
+|---|---|
+| 500 requests for one seat | exactly 1 × `201`, 499 × `409 SEAT_UNAVAILABLE`, one claim in the database |
+| 200 requests for 200 different seats | all `201` |
+| 300 overlapping 2–4-seat requests, seats in random order | only `201`/`409`, winners never share a seat, losers leave no trace, no deadlocks |
+| 50 identical retries with one idempotency key | all `201`, one booking |
+| 30 different bodies with one idempotency key | 1 × `201`, 29 × `422 IDEMPOTENCY_KEY_REUSED` |
+| Cancellation racing 30 new bookings (15 rounds) | the seat goes to at most one new owner |
+| Unsafe `naive` strategy, safety-net index present | the database still allows exactly one winner |
+| Unsafe `naive` strategy, safety-net index removed | **the suite detects the double booking** |
+| Session killed between claim and commit | `503`; no booking, seat free, key unused; retry with same key → `201` |
+| Every pooled connection killed (database restart) | the next requests succeed |
+| Database unreachable / pool exhausted | `503` + `Retry-After` within bounded time |
+| Seat row locked elsewhere / duplicate of a stuck request | `409 SEAT_CONTENDED` / `409 REQUEST_IN_PROGRESS`; not stored, so the retry succeeds |
+
+The suite also caught a real bug during development: a lock convoy in the idempotency step,
+written up in [ADR-0004](docs/adr/0004-idempotency-in-the-booking-transaction.md#lesson-from-testing-do-nothing-not-do-update--where).
+
 ## Running locally
 
 Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
@@ -87,7 +112,7 @@ A single `docker compose up` for the whole multi-replica stack arrives in Phase 
 ## Development
 
 ```bash
-uv run pytest              # unit + integration tests (needs the postgres container running)
+uv run pytest              # all tests (needs the postgres container running)
 uv run ruff check .        # lint
 uv run ruff format .       # format
 uv run mypy                # type-check (strict)
@@ -105,13 +130,15 @@ src/distribook/
 ├── api/             HTTP routes, problem+json error mapping
 ├── domain/          request/response models, domain errors
 ├── services/        booking & catalog orchestration, idempotency, retry policy
-├── strategies/      pluggable concurrency control (conditional; more in Phase 4)
+├── strategies/      pluggable concurrency control (conditional; naive = unsafe, test-only)
 ├── db/              connection pool, PostgreSQL error classification
 ├── invariants.py    SQL checks for the correctness invariants
 └── main.py          application factory
 migrations/          Alembic migrations (explicit DDL)
 tests/unit/          pure logic
 tests/integration/   every endpoint against real PostgreSQL
+tests/concurrency/   simultaneous requests across two replicas; race-detector proof
+tests/failure/       killed sessions, outages, exhausted pool, held locks
 docs/                requirements, system design, ADRs
 ```
 

@@ -248,7 +248,9 @@ Why this shape:
   with the same key arrive together, PostgreSQL makes the second `INSERT … ON CONFLICT` wait for the
   first transaction to finish. If the first commits, the second replays its stored response. If the
   first rolls back (crash, error), the second goes ahead as a fresh attempt. No "in-progress" state
-  and no lock that could be left behind (INV-4). See [ADR-0004](adr/0004-idempotency-in-the-booking-transaction.md).
+  and no lock that could be left behind (INV-4). It must be `DO NOTHING`: `DO UPDATE` would lock
+  the existing row and make duplicates queue behind each other, which the concurrency suite
+  caught. See [ADR-0004](adr/0004-idempotency-in-the-booking-transaction.md).
 - **The savepoint** lets a lost race undo the half-built booking but still commit the `409`
   outcome against the key, so replays are deterministic.
 - **The client gets `201` only after `COMMIT` succeeds** (INV-6). If the connection drops during
