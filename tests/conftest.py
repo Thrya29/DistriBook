@@ -7,7 +7,8 @@ migrated with the real Alembic migrations, so the schema under test is the shipp
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
@@ -17,6 +18,7 @@ from alembic.config import Config
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import URL, make_url, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from distribook.config import Settings
 from distribook.invariants import find_violations
@@ -71,23 +73,42 @@ def settings(database_url: str) -> Settings:
     return Settings(env="test", database_url=database_url)
 
 
-@pytest.fixture
-async def app(settings: Settings) -> AsyncIterator[FastAPI]:
+async def reset_data(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        for table in TABLES_IN_DELETE_ORDER:
+            await conn.execute(text(f"DELETE FROM {table}"))  # noqa: S608 - constant names
+
+
+async def assert_invariants(engine: AsyncEngine) -> None:
+    async with engine.connect() as conn:
+        violations = await find_violations(conn)
+    assert not violations, f"correctness invariants violated: {violations}"
+
+
+@asynccontextmanager
+async def running_app(settings: Settings, *, reset: bool = True) -> AsyncGenerator[FastAPI]:
+    """Start an app with its own connection pool. Several running at once behave like
+    separate API replicas sharing one database."""
     application = create_app(settings)
     async with application.router.lifespan_context(application):
-        engine = application.state.engine
-        async with engine.begin() as conn:
-            for table in TABLES_IN_DELETE_ORDER:
-                await conn.execute(text(f"DELETE FROM {table}"))  # noqa: S608 - constant names
+        if reset:
+            await reset_data(application.state.engine)
+        yield application
+
+
+def client_for(application: FastAPI) -> AsyncClient:
+    return AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
+
+
+@pytest.fixture
+async def app(settings: Settings) -> AsyncIterator[FastAPI]:
+    async with running_app(settings) as application:
         yield application
         # Every integration test doubles as an invariant check on the state it left behind.
-        async with engine.connect() as conn:
-            violations = await find_violations(conn)
-        assert not violations, f"correctness invariants violated: {violations}"
+        await assert_invariants(application.state.engine)
 
 
 @pytest.fixture
 async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as http:
+    async with client_for(app) as http:
         yield http
