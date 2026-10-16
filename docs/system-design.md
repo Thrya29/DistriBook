@@ -195,6 +195,7 @@ Location: /v1/bookings/6b0f9a43-5f0e-4f0a-9a3e-6a51d3c2b1f7
 | 404 | `EVENT_NOT_FOUND` | Unknown event | fix request | no |
 | 409 | `SEAT_UNAVAILABLE` | One or more seats already booked; body lists `unavailable_seat_ids` | choose other seats, **new key** | **yes** |
 | 409 | `SEAT_CONTENDED` | Seat is locked by an in-flight request (only `nowait` / `redis_lock` strategies, or lock wait timed out) | retry, same key | no |
+| 409 | `REQUEST_IN_PROGRESS` | The original request with this key is still running and outlasted `lock_timeout` | retry, same key | no |
 | 422 | `VALIDATION_ERROR` | Bad body: 0 or > 10 seats, duplicate IDs, … | fix request | no |
 | 422 | `INVALID_SEATS` | Seat IDs not in this event | fix request | no |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same key, different body | use a new key | n/a |

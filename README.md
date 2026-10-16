@@ -18,11 +18,11 @@ each one behaves under load.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Repository skeleton, tooling, CI | ✅ Done |
-| 1 | [Requirements](docs/requirements.md), [system design](docs/system-design.md), [ADRs](docs/adr/) | 📝 Drafted, under review |
-| 2 | Schema, migrations, core API (`conditional` strategy) | ⏳ Next |
-| 3 | Concurrency & failure test suites, idempotency, multi-seat bookings | ⏳ |
-| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; observability | ⏳ |
-| 5 | Multi-replica Docker Compose stack, k6 scenarios, benchmark pipeline | ⏳ |
+| 1 | [Requirements](docs/requirements.md), [system design](docs/system-design.md), [ADRs](docs/adr/) | ✅ Done |
+| 2 | Schema & migrations, full booking API (`conditional` strategy), idempotency, cancellation, integration tests | ✅ Done |
+| 3 | Concurrency & failure test suites (hot seat, overlapping multi-seat, duplicate keys, crash mid-transaction) | ⏳ Next |
+| 4 | `pessimistic`, `pessimistic_nowait`, `redis_lock` strategies; structured logs & Prometheus metrics | ⏳ |
+| 5 | Multi-replica Docker Compose stack (nginx), k6 scenarios, benchmark pipeline | ⏳ |
 | 6 | Benchmark runs, analysis, final documentation | ⏳ |
 
 ## How double booking is prevented (summary)
@@ -35,37 +35,84 @@ each one behaves under load.
 3. **Deadlock-free multi-seat bookings:** every transaction locks seats in ascending ID order.
 4. **Safe retries:** an `Idempotency-Key` is recorded in the *same transaction* as the booking, so a
    retried request replays the original result instead of booking twice.
-5. **Proof the tests can catch a race:** the concurrency suite is also run against a deliberately
-   unsafe strategy with the safety net removed, and must detect the double booking.
+5. **Every test checks correctness:** after each integration test, SQL checks verify that the
+   correctness invariants (e.g. *no seat has two active bookings*) still hold.
 
 The full reasoning is in the [system design](docs/system-design.md) and [ADRs](docs/adr/).
 
-## Planned stack
+## API
 
-Python 3.12 · FastAPI · SQLAlchemy 2.0 Core + asyncpg · PostgreSQL 16 · Alembic · Redis 7 (one
-strategy only) · pytest · k6 · nginx · Prometheus/Grafana · Docker Compose · GitHub Actions
+| Method & path | Purpose |
+|---|---|
+| `POST /v1/events` | Create an event with a generated seat grid |
+| `GET /v1/events/{id}` | Event with seat counts |
+| `GET /v1/events/{id}/seats?status=&limit=&after_id=` | List seats (keyset pagination) |
+| `GET /v1/seats/{id}` | One seat |
+| `POST /v1/bookings` + `Idempotency-Key` header | Book 1–10 seats, all or nothing |
+| `GET /v1/bookings/{id}` | One booking |
+| `POST /v1/bookings/{id}/cancel` | Cancel (idempotent) |
+| `GET /healthz`, `GET /readyz` | Liveness / readiness |
+
+Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json` with a
+stable `code` (`SEAT_UNAVAILABLE`, `IDEMPOTENCY_KEY_REUSED`, `SERVICE_OVERLOADED`, …). Interactive
+docs are served at `/docs` while the app is running.
+
+```console
+$ curl -X POST localhost:8000/v1/bookings -H 'Idempotency-Key: 7f3c…' \
+       -H 'content-type: application/json' \
+       -d '{"event_id": 1, "user_id": "alice", "seat_ids": [1, 2]}'
+HTTP/1.1 201 Created
+Location: /v1/bookings/fe11177f-2fa8-4f85-8426-abc76b13a54a
+
+# a different client asking for the same seats
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+{"code": "SEAT_UNAVAILABLE", "unavailable_seat_ids": [1, 2], ...}
+```
+
+## Running locally
+
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
+
+```bash
+docker compose up -d --wait postgres     # PostgreSQL 16 on 127.0.0.1:5432
+uv sync                                  # create .venv with locked dependencies
+uv run alembic upgrade head              # apply migrations
+uv run uvicorn distribook.main:create_app --factory --port 8000
+```
+
+Settings are read from `DISTRIBOOK_*` environment variables. See [.env.example](.env.example).
+A single `docker compose up` for the whole multi-replica stack arrives in Phase 5.
 
 ## Development
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
-
 ```bash
-uv sync                    # create .venv with locked dependencies
+uv run pytest              # unit + integration tests (needs the postgres container running)
 uv run ruff check .        # lint
 uv run ruff format .       # format
 uv run mypy                # type-check (strict)
-uv run pytest              # tests
 ```
 
-`docker compose up` to run the whole system arrives in Phase 5.
+Integration tests run against a real PostgreSQL. The test database (`distribook_test`) is dropped,
+recreated and migrated at the start of each run, and the suite refuses to run against any
+database whose name doesn't end in `_test`. CI runs the same tests against a PostgreSQL service
+container, and checks that migrations can be applied and fully reversed.
 
 ## Repository layout
 
 ```
-docs/                  requirements, system design, architecture decision records
-src/distribook/        application package
-tests/                 automated tests
-.github/workflows/     CI
+src/distribook/
+├── api/             HTTP routes, problem+json error mapping
+├── domain/          request/response models, domain errors
+├── services/        booking & catalog orchestration, idempotency, retry policy
+├── strategies/      pluggable concurrency control (conditional; more in Phase 4)
+├── db/              connection pool, PostgreSQL error classification
+├── invariants.py    SQL checks for the correctness invariants
+└── main.py          application factory
+migrations/          Alembic migrations (explicit DDL)
+tests/unit/          pure logic
+tests/integration/   every endpoint against real PostgreSQL
+docs/                requirements, system design, ADRs
 ```
 
 ## License

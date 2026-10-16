@@ -83,7 +83,7 @@ These are the properties the system must **never** violate. Each one is checked 
 | ID | Category | Requirement |
 |---|---|---|
 | NFR-1 | Correctness | Zero invariant violations across all test suites and all benchmark runs. |
-| NFR-2 | Robustness | Under hot-seat contention (≥ 500 simultaneous requests for one seat): exactly one `201`, all others `409`, zero `5xx`. |
+| NFR-2 | Robustness | Under hot-seat contention (≥ 500 simultaneous requests for one seat): exactly one `201`. Every other response is `409`, or a `503` + `Retry-After` for a request that was deliberately turned away because connection capacity ran out (NFR-3). Zero `500`s. When capacity is large enough for the burst, every loser gets `409`. |
 | NFR-3 | Graceful degradation | When load is too high, the service sheds it with `503` + `Retry-After` within a bounded time (≤ 2 s) instead of letting requests wait indefinitely or time out silently. |
 | NFR-4 | Horizontal scaling | Correctness holds with ≥ 2 stateless API replicas behind a load balancer. |
 | NFR-5 | Failure safety | If the process or the database connection dies mid-request, no partial booking remains. A request is never reported as successful unless it was committed. |
