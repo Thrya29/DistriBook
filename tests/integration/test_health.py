@@ -1,4 +1,8 @@
+from typing import cast
+
+from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy.pool import QueuePool
 
 
 async def test_liveness(client: AsyncClient) -> None:
@@ -18,3 +22,8 @@ async def test_unknown_route_is_problem_json(client: AsyncClient) -> None:
     assert response.status_code == 404
     assert response.headers["content-type"] == "application/problem+json"
     assert response.json()["code"] == "HTTP_404"
+
+
+async def test_connection_pool_is_warm_after_startup(app: FastAPI) -> None:
+    pool = cast(QueuePool, app.state.engine.pool)
+    assert pool.checkedin() == app.state.settings.db_pool_size

@@ -25,6 +25,21 @@ CONTENTION_TUNING: dict[str, Any] = {
 }
 
 
+CREATED = (201, None)
+SEAT_UNAVAILABLE = (409, "SEAT_UNAVAILABLE")
+SEAT_CONTENDED = (409, "SEAT_CONTENDED")
+SERVICE_OVERLOADED = (503, "SERVICE_OVERLOADED")
+
+# What a request that did not win may receive. SEAT_UNAVAILABLE is the definitive answer. The
+# other two are bounded, retryable load shedding: a NOWAIT or Redis rejection, or a lock wait /
+# statement that ran past its timeout. Timeouts depend on timing: this harness runs both replicas
+# and hundreds of clients on one event loop, so under CPU saturation a winner's transaction can
+# hold its lock long enough for some waiters to time out, with any strategy. The tests assert
+# correctness strictly and allow these outcomes; how often they occur is a performance property,
+# measured by the benchmarks rather than asserted here.
+LOSING_OUTCOMES = {SEAT_UNAVAILABLE, SEAT_CONTENDED, SERVICE_OVERLOADED}
+
+
 @dataclass(frozen=True)
 class Call:
     method: str

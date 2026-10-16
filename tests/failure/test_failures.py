@@ -14,13 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from distribook.config import Settings
 from distribook.services.booking_service import BookingService
-from distribook.strategies import ClaimResult
+from distribook.strategies import BookingStrategy, ClaimResult
 from distribook.strategies.conditional import ConditionalStrategy
 from tests.conftest import client_for, running_app
 from tests.integration.helpers import book, create_event, seat_ids, seat_status
 
 
-class DiesAfterClaim:
+class DiesAfterClaim(BookingStrategy):
     """Claims the seats, then has PostgreSQL terminate this very session before COMMIT,
     as if the API process or its network link died mid-transaction."""
 
@@ -48,7 +48,9 @@ async def test_session_killed_mid_transaction_leaves_no_trace(
     event = await create_event(client, rows=1, seats_per_row=1)
     seat = (await seat_ids(client, event["id"]))[0]
     healthy = app.state.bookings
-    app.state.bookings = BookingService(app.state.engine, DiesAfterClaim(), settings)
+    app.state.bookings = BookingService(
+        app.state.engine, DiesAfterClaim(), settings, app.state.metrics
+    )
 
     crashed = await book(client, event["id"], [seat], key="crash-1")
 

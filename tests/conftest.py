@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEST_DATABASE_URL = (
     "postgresql+asyncpg://distribook:distribook@127.0.0.1:5432/distribook_test"
 )
+DEFAULT_TEST_REDIS_URL = "redis://127.0.0.1:6380/0"
 # Children before parents. DELETE rather than TRUNCATE: tables are tiny between tests, and
 # TRUNCATE's file rewrite + fsync is slow on virtualised disks (Docker Desktop).
 TABLES_IN_DELETE_ORDER = ("idempotency_keys", "booking_seats", "seats", "bookings", "events")
@@ -70,7 +71,13 @@ def database_url() -> str:
 
 @pytest.fixture
 def settings(database_url: str) -> Settings:
-    return Settings(env="test", database_url=database_url)
+    return Settings(
+        env="test",
+        database_url=database_url,
+        redis_url=os.environ.get("DISTRIBOOK_TEST_REDIS_URL", DEFAULT_TEST_REDIS_URL),
+        log_level="WARNING",
+        idempotency_purge_interval_s=0,  # tests run the purge explicitly
+    )
 
 
 async def reset_data(engine: AsyncEngine) -> None:

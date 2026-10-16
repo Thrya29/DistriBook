@@ -31,8 +31,18 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 30
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     env:
       DISTRIBOOK_TEST_DATABASE_URL: postgresql+asyncpg://distribook:distribook@127.0.0.1:5432/distribook_test
+      DISTRIBOOK_TEST_REDIS_URL: redis://127.0.0.1:6380/0
     steps:
       - uses: actions/checkout@v4
 

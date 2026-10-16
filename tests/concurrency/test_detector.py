@@ -22,7 +22,13 @@ from distribook.config import Settings
 from distribook.invariants import find_violations
 from distribook.services.booking_service import ONE_ACTIVE_CLAIM_INDEX, BookingService
 from distribook.strategies.naive import NaiveStrategy
-from tests.concurrency.harness import CONTENTION_TUNING, booking_call, fire_simultaneously
+from tests.concurrency.harness import (
+    CONTENTION_TUNING,
+    CREATED,
+    LOSING_OUTCOMES,
+    booking_call,
+    fire_simultaneously,
+)
 from tests.conftest import assert_invariants, client_for, reset_data, running_app
 from tests.integration.helpers import create_event, seat_ids
 
@@ -53,7 +59,7 @@ async def naive_replicas(
 
 def _use_naive_with_race_window(app: FastAPI, settings: Settings) -> None:
     app.state.bookings = BookingService(
-        app.state.engine, NaiveStrategy(race_window_s=RACE_WINDOW_S), settings
+        app.state.engine, NaiveStrategy(race_window_s=RACE_WINDOW_S), settings, app.state.metrics
     )
 
 
@@ -63,7 +69,7 @@ async def _hot_seat(clients: list[AsyncClient]) -> int:
     outcomes = await fire_simultaneously(
         clients, [booking_call(event["id"], [seat], user_id=f"user-{i}") for i in range(CONTENDERS)]
     )
-    assert {o.status for o in outcomes} <= {201, 409}
+    assert {o.key for o in outcomes} <= {CREATED} | LOSING_OUTCOMES
     return sum(o.status == 201 for o in outcomes)
 
 
